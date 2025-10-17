@@ -899,8 +899,6 @@ class DreamLoRA(TemplateLM):
                 contexts,
                 truncation=self.truncation,
             )
-
-
             
             input_ids = context_enc[0].unsqueeze(0)  # Take the first one and add batch dimension
             
