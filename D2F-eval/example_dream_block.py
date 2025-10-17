@@ -3,7 +3,7 @@ warnings.filterwarnings("ignore")
 import argparse
 import random
 import time
-from typing import Dict, Set
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
@@ -11,9 +11,9 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from peft import PeftModel, PeftConfig
 
-# LLaDA model classes (local cache wrappers)
-from model_cache.llada.modeling_llada import LLaDAModelLM
-from model_cache.llada.configuration_llada import LLaDAConfig
+# Dream model classes (local cache wrappers)
+from model_cache.dream.model_dream import DreamModel
+from model_cache.dream.configuration_dream import DreamConfig
 
 
 def set_seed(seed: int) -> None:
@@ -96,20 +96,32 @@ def sample_tokens(logits: torch.Tensor, temperature: float = 0.0, top_p: float =
     return initial_confidence, x0
 
 
+def shift_logits(logits: torch.Tensor, last_logit: torch.Tensor = None) -> torch.Tensor:
+    if logits.shape[1] == 0:
+        raise Exception("logits sequence length is 0")
+    shifted = torch.zeros_like(logits)
+    shifted[:, 1:, :] = logits[:, :-1, :]
+    if last_logit is not None:
+        shifted[:, 0, :] = last_logit
+        return shifted
+    shifted[:, 0, :] = 1.0
+    return shifted
+
+
 @torch.inference_mode()
 def main():
-    parser = argparse.ArgumentParser(description="Simple LLaDA block-based generation example")
-    parser.add_argument('--pretrained_path', type=str, default='GSAI-ML/LLaDA-8B-Instruct')
-    parser.add_argument('--lora_path', type=str, default='SJTU-Deng-Lab/D2F_LLaDA_Instruct_8B_Lora')
+    parser = argparse.ArgumentParser(description="Simple Dream block-based generation example")
+    parser.add_argument('--pretrained_path', type=str, default='Dream-org/Dream-v0-Base-7B')
+    parser.add_argument('--lora_path', type=str, default='SJTU-Deng-Lab/D2F_Dream_Base_7B_Lora')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dtype', type=str, default='bfloat16', choices=['bfloat16', 'float16', 'float32'])
-    parser.add_argument('--max_length', type=int, default=4096)
+    parser.add_argument('--max_length', type=int, default=2048)
     parser.add_argument('--max_new_tokens', type=int, default=256)
-    parser.add_argument('--block_size', type=int, default=32)
-    parser.add_argument('--block_add_threshold', type=float, default=0.1)
-    parser.add_argument('--decoded_token_threshold', type=float, default=0.5)
-    parser.add_argument('--skip_threshold', type=float, default=0.9)
-    parser.add_argument('--temperature', type=float, default=0.0)
+    parser.add_argument('--block_size', type=int, default=4)
+    parser.add_argument('--block_add_threshold', type=float, default=0.5)
+    parser.add_argument('--decoded_token_threshold', type=float, default=0.9)
+    parser.add_argument('--skip_threshold', type=float, default=1.0)
+    parser.add_argument('--temperature', type=float, default=0.2)
     parser.add_argument('--top_p', type=float, default=None)
     parser.add_argument('--top_k', type=int, default=None)
     parser.add_argument('--seed', type=int, default=42)
@@ -126,18 +138,18 @@ def main():
         target_dtype = torch.float32
 
     # Load model + LoRA
-    config = LLaDAConfig.from_pretrained(args.pretrained_path)
-    model = LLaDAModelLM.from_pretrained(
-        args.pretrained_path, config=config, torch_dtype=target_dtype
+    model_config = DreamConfig.from_pretrained(args.pretrained_path, trust_remote_code=True)
+    model = DreamModel.from_pretrained(
+        args.pretrained_path, config=model_config, torch_dtype=target_dtype, trust_remote_code=True
     ).eval()
     model = PeftModel.from_pretrained(model, args.lora_path)
     model = model.to(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    mask_token_id = 126336
+    mask_token_id = 151666
     eos_token_id = tokenizer.eos_token_id
 
     # Build a few-shot GSM8K prompt
@@ -179,7 +191,7 @@ def main():
     current_blocks = 0
     step = 0
     eos_detected = False
-    cache_length = 0
+    last_logits = None
 
     start_time = time.time()
 
@@ -207,7 +219,7 @@ def main():
                     }
                     current_blocks += 1
 
-        # Update completion states: when a block reaches the threshold, allow the next block to become complete
+        # Update completion states
         for block_id in sorted(block_states.keys()):
             decoded_tokens = block_states[block_id]['total_masks'] - block_states[block_id]['mask_count']
             if block_states[block_id]['total_masks'] > 0:
@@ -218,6 +230,9 @@ def main():
 
         if (x_t == mask_token_id).sum() == 0 and current_blocks == 0:
             break
+
+        # Determine cache length from past_key_values
+        cache_length = 0 if past_key_values is None else past_key_values.get_seq_length()
 
         # Determine blocks to cache and input segment
         blocks_to_cache = [bid for bid, state in block_states.items() if state['state'] == 'to_cache']
@@ -239,25 +254,29 @@ def main():
         if input_seq.shape[1] == 0:
             break
 
-        # Extract per-step attention bias
+        # Extract per-step attention mask
         attention_mask = extract_attention_mask(full_attention_mask, process_start_pos, input_seq.shape[1], cache_length)
 
         outputs = model(
             input_seq,
-            attention_bias=attention_mask,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
-            update_kvcache=update_kvcache + cache_length,
+            update_kvcache=update_kvcache,
         )
 
         if update_kvcache > 0:
+            cache_end_idx = update_kvcache - 1
+            last_logits = outputs.logits[:, cache_end_idx, :].unsqueeze(1)
             past_key_values = outputs.past_key_values
             for bid in blocks_to_cache:
                 block_states[bid]['state'] = 'in_cache'
 
+        # Shift logits for AR prediction
+        logits = shift_logits(outputs.logits, last_logit=last_logits)
+
         # Decode masked tokens within each active block
         blocks_to_deactivate = []
-        mask_index = (x_t == mask_token_id)
         for block_id, state in block_states.items():
             if state['state'] != 'active':
                 continue
@@ -268,7 +287,7 @@ def main():
                 blocks_to_deactivate.append(block_id)
                 continue
             logit_offset = block_start - process_start_pos
-            block_mask_logits = outputs.logits[:, logit_offset + block_mask_locs, :]
+            block_mask_logits = logits[:, logit_offset + block_mask_locs, :]
 
             initial_confidence, x0 = sample_tokens(
                 block_mask_logits.squeeze(0),
@@ -277,7 +296,6 @@ def main():
                 top_k=args.top_k,
             )
 
-            # Simple policy: if block is complete and nothing exceeds threshold, force one token; else only fill confident positions
             high_conf_indices = (initial_confidence > args.skip_threshold).nonzero().squeeze(-1)
             if state['is_complete'] and high_conf_indices.numel() == 0 and block_mask_logits.numel() > 0:
                 _, top_idx = torch.topk(initial_confidence, 1)
@@ -299,10 +317,6 @@ def main():
                 block_states[bid]['state'] = 'to_cache'
                 current_blocks -= 1
 
-        if update_kvcache > 0:
-            cache_length += update_kvcache
-
-        # Safety
         if step > 10000:
             break
 
